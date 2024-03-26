@@ -335,42 +335,40 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
 }
 
 #[derive(Debug, Default)]
-enum TxState {
+enum TxState<'conn> {
     Started {
         kind: OpenTxKind,
-        write_permit: Option<OwnedSemaphorePermit>,
+        tx: TxGuard<'conn>,
     },
     #[default]
     Ended,
 }
 
-impl TxState {
-    fn implicit() -> Self {
-        Self::Started {
+impl<'conn> TxState<'conn> {
+    fn implicit(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        Ok(Self::Started {
             kind: OpenTxKind::Implicit,
-            write_permit: None,
-        }
+            tx: TxGuard::start(conn)?,
+        })
     }
-    fn explicit() -> Self {
-        Self::Started {
+    fn explicit(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        Ok(Self::Started {
             kind: OpenTxKind::Explicit,
-            write_permit: None,
-        }
+            tx: TxGuard::start(conn)?,
+        })
     }
 
     fn is_writing(&self) -> bool {
-        matches!(
-            self,
-            TxState::Started {
-                write_permit: Some(_),
-                ..
-            }
-        )
+        if let TxState::Started { tx, .. } = &self {
+            tx.has_write_permit()
+        } else {
+            false
+        }
     }
 
     fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
         match self {
-            TxState::Started { write_permit, .. } => *write_permit = Some(permit),
+            TxState::Started { tx, .. } => tx.set_write_permit(permit),
             TxState::Ended => {
                 // do nothing, maybe bomb?
             }
@@ -399,21 +397,22 @@ impl TxState {
         matches!(self, TxState::Ended)
     }
 
-    fn start_implicit(&mut self) {
-        *self = Self::implicit()
+    fn start_implicit(&mut self, conn: &'conn Connection) -> rusqlite::Result<()> {
+        *self = Self::implicit(conn)?;
+        Ok(())
     }
 
-    fn start_explicit(&mut self) {
-        *self = Self::explicit()
+    fn start_explicit(&mut self, conn: &'conn Connection) -> rusqlite::Result<()> {
+        *self = Self::explicit(conn)?;
+        Ok(())
     }
 
-    fn end(&mut self) -> Option<OwnedSemaphorePermit> {
-        let permit = match self {
-            TxState::Started { write_permit, .. } => write_permit.take(),
+    fn take_tx(&mut self) -> Option<TxGuard<'conn>> {
+        let prev = std::mem::take(self);
+        match prev {
+            TxState::Started { tx, .. } => Some(tx),
             TxState::Ended => None,
-        };
-        *self = TxState::Ended;
-        permit
+        }
     }
 }
 
@@ -1401,7 +1400,7 @@ pub async fn start(
                                 )?;
                             }
                             PgWireFrontendMessage::Sync(_) => {
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                send_ready(&mut session, discard_until_sync, &back_tx)?;
 
                                 // reset this
                                 discard_until_sync = false;
@@ -1472,7 +1471,7 @@ pub async fn start(
 
                                     discard_until_sync = true;
 
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
                             }
@@ -1494,12 +1493,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
+                                        send_ready(&mut session, discard_until_sync, &back_tx)?;
                                         continue;
                                     }
                                 };
@@ -1515,7 +1509,7 @@ pub async fn start(
                                             .into(),
                                     )?;
 
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
 
@@ -1527,48 +1521,38 @@ pub async fn start(
                                             message: e.try_into()?,
                                             flush: true,
                                         })?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
+                                        send_ready(&mut session, discard_until_sync, &back_tx)?;
                                         continue 'outer;
                                     }
                                 }
 
                                 // automatically commit an implicit tx
                                 if session.tx_state.is_implicit() {
-                                    trace!("committing IMPLICIT tx");
-                                    let _permit = session.tx_state.end();
-
-                                    if let Err(e) = session.handle_commit(&conn) {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
+                                    if let Some(tx) = session.tx_state.take_tx() {
+                                        trace!("committing IMPLICIT tx");
+                                        if let Err(e) = session.handle_commit(tx) {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
-                                        continue;
+                                            )?;
+                                            send_ready(&mut session, discard_until_sync, &back_tx)?;
+                                            continue;
+                                        }
+                                        trace!("committed IMPLICIT tx");
                                     }
-                                    trace!("committed IMPLICIT tx");
                                 }
 
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                send_ready(&mut session, discard_until_sync, &back_tx)?;
                             }
                             PgWireFrontendMessage::Terminate(_) => {
                                 break;
@@ -1735,15 +1719,15 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
-struct Session {
+struct Session<'conn> {
     agent: Agent,
-    tx_state: TxState,
+    tx_state: TxState<'conn>,
 }
 
-impl Session {
+impl<'conn> Session<'conn> {
     fn handle_query(
         &mut self,
-        conn: &Connection,
+        conn: &'conn Connection,
         cmd: &ParsedCmd,
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
@@ -1776,28 +1760,28 @@ impl Session {
 
         // need to start an implicit transaction
         if self.tx_state.is_ended() && !cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
             trace!("started IMPLICIT tx");
-            self.tx_state.start_implicit();
+            self.tx_state.start_implicit(conn)?;
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
-            trace!("committing IMPLICIT tx");
-            let _permit = self.tx_state.end();
-
-            self.handle_commit(conn)?;
-            trace!("committed IMPLICIT tx");
+            if let Some(tx) = self.tx_state.take_tx() {
+                trace!("committing IMPLICIT tx");
+                self.handle_commit(tx)?;
+                trace!("committed IMPLICIT tx");
+            }
         }
 
         let count = if cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
-            self.tx_state.start_explicit();
+            self.tx_state.start_explicit(conn)?;
             0
         } else if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            if let Some(tx) = self.tx_state.take_tx() {
+                self.handle_commit(tx)?;
+            }
             0
         } else if cmd.is_rollback() {
-            let _permit = self.tx_state.end();
-            conn.execute_batch("ROLLBACK")?;
+            if let Some(tx) = self.tx_state.take_tx() {
+                tx.rollback()?;
+            }
             0
         } else {
             let mut prepped = if cmd.is_pg() {
@@ -1890,14 +1874,14 @@ impl Session {
         if cmd.is_begin() {
             trace!("setting EXPLICIT tx");
             // explicit tx
-            self.tx_state.start_explicit();
+            self.tx_state.start_explicit(conn);
         }
 
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_execute<'conn>(
+    fn handle_execute(
         &mut self,
         conn: &'conn Connection,
         prepped: &mut Statement<'conn>,
@@ -1931,21 +1915,19 @@ impl Session {
         if self.tx_state.is_ended() {
             if !cmd.is_begin() && !prepped.readonly() {
                 // NOT in a tx and statement mutates DB...
-                conn.execute_batch("BEGIN")?;
-
-                self.tx_state.start_implicit();
+                self.tx_state.start_implicit(conn)?;
                 opened_implicit_tx = true;
             } else if cmd.is_begin() {
-                conn.execute_batch("BEGIN")?;
-                self.tx_state.start_explicit();
+                self.tx_state.start_explicit(conn)?;
             }
         }
 
         let mut count = 0;
 
         if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            if let Some(tx) = self.tx_state.take_tx() {
+                self.handle_commit(tx)?;
+            }
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("statement writes, acquiring permit...");
@@ -2086,8 +2068,9 @@ impl Session {
             }
 
             if opened_implicit_tx {
-                let _permit = self.tx_state.end();
-                self.handle_commit(conn)?;
+                if let Some(tx) = self.tx_state.take_tx() {
+                    self.handle_commit(tx)?;
+                }
             }
         }
 
@@ -2108,7 +2091,7 @@ impl Session {
         Ok(())
     }
 
-    fn handle_commit(&self, conn: &Connection) -> Result<(), ChangeError> {
+    fn handle_commit(&self, tx: TxGuard) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
         let mut book_writer = self
             .agent
@@ -2116,8 +2099,6 @@ impl Session {
             .blocking_write("handle_write_tx(book_writer)");
 
         let actor_id = self.agent.actor_id();
-
-        let tx = TxGuard::new(conn);
 
         let insert_info = insert_local_changes(&self.agent, &tx, &mut book_writer)?;
 
@@ -2157,14 +2138,29 @@ impl Session {
     }
 }
 
+#[derive(Debug)]
 struct TxGuard<'conn> {
     conn: &'conn Connection,
+    write_permit: Option<OwnedSemaphorePermit>,
     ended: bool,
 }
 
 impl<'conn> TxGuard<'conn> {
-    fn new(conn: &'conn Connection) -> Self {
-        Self { conn, ended: false }
+    fn start(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch("BEGIN")?;
+        Ok(Self {
+            conn,
+            write_permit: None,
+            ended: false,
+        })
+    }
+
+    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
+        self.write_permit = Some(permit);
+    }
+
+    fn has_write_permit(&self) -> bool {
+        self.write_permit.is_some()
     }
 
     fn commit(mut self) -> rusqlite::Result<()> {
@@ -2193,7 +2189,8 @@ impl<'conn> Drop for TxGuard<'conn> {
         if self.ended {
             return;
         }
-        self.rollback_();
+        // default rollback if not commited!
+        _ = self.rollback_();
     }
 }
 
@@ -2208,20 +2205,20 @@ impl<'conn> Deref for TxGuard<'conn> {
 
 fn send_ready(
     session: &mut Session,
-    conn: &Connection,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
     let ready_status = if session.tx_state.is_implicit() {
-        let _permit = session.tx_state.end(); // do this first, in case of failure
-        if discard_until_sync {
-            // an error occured, rollback implicit tx!
-            warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            conn.execute_batch("ROLLBACK")?;
-        } else {
-            // no error, commit implicit tx
-            warn!("receive Sync message, committing implicit tx");
-            session.handle_commit(conn)?;
+        if let Some(tx) = session.tx_state.take_tx() {
+            if discard_until_sync {
+                // an error occured, rollback implicit tx!
+                warn!("receive Sync message w/ an error to send, rolling back implicit tx");
+                tx.rollback()?;
+            } else {
+                // no error, commit implicit tx
+                warn!("receive Sync message, committing implicit tx");
+                session.handle_commit(tx)?;
+            }
         }
 
         READY_STATUS_IDLE
