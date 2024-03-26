@@ -1763,6 +1763,7 @@ impl<'conn> Session<'conn> {
             trace!("started IMPLICIT tx");
             self.tx_state.start_implicit(conn)?;
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
+            // this starts a new transaction, commits the previous implicit one
             if let Some(tx) = self.tx_state.take_tx() {
                 trace!("committing IMPLICIT tx");
                 self.handle_commit(tx)?;
@@ -1870,12 +1871,6 @@ impl<'conn> Session<'conn> {
                     .into(),
             )
             .map_err(|_| QueryError::BackendResponseSendFailed)?;
-
-        if cmd.is_begin() {
-            trace!("setting EXPLICIT tx");
-            // explicit tx
-            self.tx_state.start_explicit(conn);
-        }
 
         Ok(())
     }
