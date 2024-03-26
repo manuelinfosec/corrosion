@@ -2113,6 +2113,11 @@ impl Session {
 
     fn handle_commit(&self, conn: &Connection) -> rusqlite::Result<()> {
         trace!("HANDLE COMMIT");
+        let mut book_writer = self
+            .agent
+            .booked()
+            .blocking_write("handle_write_tx(book_writer)");
+
         let actor_id = self.agent.actor_id();
 
         let ts = Timestamp::from(self.agent.clock().new_timestamp());
@@ -2133,11 +2138,6 @@ impl Session {
         let last_seq: CrsqlSeq = conn
             .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
             .query_row([db_version], |row| row.get(0))?;
-
-        let mut book_writer = self
-            .agent
-            .booked()
-            .blocking_write("handle_write_tx(book_writer)");
 
         let last_version = book_writer.last().unwrap_or_default();
         trace!("last_version: {last_version}");
