@@ -1,8 +1,7 @@
-use std::{iter::Peekable, ops::RangeInclusive, time::Duration};
+use std::{iter::Peekable, ops::RangeInclusive};
 
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
 use corro_base_types::{CrsqlDbVersion, Version};
-use parking_lot::RwLockWriteGuard;
 use rusqlite::{named_params, Connection};
 use tracing::{debug, trace};
 
