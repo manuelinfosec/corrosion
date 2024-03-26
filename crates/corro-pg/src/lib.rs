@@ -2116,7 +2116,19 @@ impl Session {
 
         let actor_id = self.agent.actor_id();
 
-        let insert_info = insert_local_changes(&self.agent, conn, &mut book_writer)?;
+        let insert_info = match insert_local_changes(&self.agent, conn, &mut book_writer) {
+            Ok(insert_info) => insert_info,
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(actor_id),
+                        version: None,
+                    })?;
+                return Err(e);
+            }
+        };
+
         conn.execute_batch("COMMIT")
             .map_err(|source| ChangeError::Rusqlite {
                 source,
