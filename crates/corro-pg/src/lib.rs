@@ -6,6 +6,7 @@ use std::{
     fmt,
     future::poll_fn,
     net::SocketAddr,
+    ops::Deref,
     str::{FromStr, Utf8Error},
     sync::Arc,
 };
@@ -2116,25 +2117,15 @@ impl Session {
 
         let actor_id = self.agent.actor_id();
 
-        let insert_info = match insert_local_changes(&self.agent, conn, &mut book_writer) {
-            Ok(insert_info) => insert_info,
-            Err(e) => {
-                conn.execute_batch("ROLLBACK")
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(actor_id),
-                        version: None,
-                    })?;
-                return Err(e);
-            }
-        };
+        let tx = TxGuard::new(conn);
 
-        conn.execute_batch("COMMIT")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?;
+        let insert_info = insert_local_changes(&self.agent, &tx, &mut book_writer)?;
+
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?;
 
         if let Some(InsertChangesInfo {
             version,
@@ -2163,6 +2154,55 @@ impl Session {
         }
 
         Ok(())
+    }
+}
+
+struct TxGuard<'conn> {
+    conn: &'conn Connection,
+    ended: bool,
+}
+
+impl<'conn> TxGuard<'conn> {
+    fn new(conn: &'conn Connection) -> Self {
+        Self { conn, ended: false }
+    }
+
+    fn commit(mut self) -> rusqlite::Result<()> {
+        self.commit_()
+    }
+
+    fn commit_(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.ended = true;
+        Ok(())
+    }
+
+    fn rollback(mut self) -> rusqlite::Result<()> {
+        self.rollback_()
+    }
+
+    fn rollback_(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        self.ended = true;
+        Ok(())
+    }
+}
+
+impl<'conn> Drop for TxGuard<'conn> {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        self.rollback_();
+    }
+}
+
+impl<'conn> Deref for TxGuard<'conn> {
+    type Target = Connection;
+
+    #[inline]
+    fn deref(&self) -> &Connection {
+        self.conn
     }
 }
 
