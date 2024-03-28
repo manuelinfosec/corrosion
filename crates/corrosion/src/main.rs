@@ -457,6 +457,11 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::CompactEmpties => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::CompactEmpties)
+                .await?;
+        }
     }
 
     Ok(())
@@ -617,6 +622,9 @@ enum Command {
     /// Tls-related commands
     #[command(subcommand)]
     Tls(TlsCommand),
+
+    /// Clear overwritten versions
+    CompactEmpties,
 }
 
 #[derive(Subcommand)]

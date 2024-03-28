@@ -17,8 +17,7 @@ use std::{
 
 use crate::{
     agent::{
-        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER,
-        MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
+        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
     },
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
@@ -28,7 +27,9 @@ use crate::{
 };
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
+    agent::{
+        Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion, SplitPool,
+    },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
@@ -55,6 +56,7 @@ use rusqlite::{
 use spawn::spawn_counted;
 use tokio::{
     net::TcpListener,
+    sync::mpsc::Sender,
     task::block_in_place,
     time::{sleep, timeout},
 };
@@ -130,138 +132,219 @@ pub async fn initialise_foca(agent: &Agent) {
     }
 }
 
-/// Prune the database
-pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie, sleep_in_secs: u64) {
+pub async fn clear_overwritten_versions_loop(agent: Agent, bookie: Bookie, sleep_in_secs: u64) {
     let pool = agent.pool();
     let sleep_duration = Duration::from_secs(sleep_in_secs);
-    
+
     loop {
         sleep(sleep_duration).await;
-
         info!("Starting compaction...");
-        let start = Instant::now();
 
-        let bookie_clone = {
-            bookie
-                .read("gather_booked_for_compaction")
+        if clear_overwritten_versions(&agent, &bookie, pool, None)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+    }
+}
+
+/// Prune the database
+pub async fn clear_overwritten_versions(
+    agent: &Agent,
+    bookie: &Bookie,
+    pool: &SplitPool,
+    feedback: Option<Sender<String>>,
+) -> Result<(), String> {
+    let start = Instant::now();
+
+    let bookie_clone = {
+        bookie
+            .read("gather_booked_for_compaction")
+            .await
+            .iter()
+            .map(|(actor_id, booked)| (*actor_id, booked.clone()))
+            .collect::<HashMap<ActorId, _>>()
+    };
+
+    let mut inserted = 0;
+    let mut deleted = 0;
+
+    let mut db_elapsed = Duration::new(0, 0);
+
+    if let Some(ref tx) = feedback {
+        tx.send(format!(
+            "Compacting changes for {} actors",
+            bookie_clone.len()
+        ))
+        .await
+        .map_err(|e| format!("{e}"))?;
+    }
+
+    for (actor_id, booked) in bookie_clone {
+        if let Some(ref tx) = feedback {
+            tx.send(format!("Starting change compaction for {actor_id}"))
                 .await
-                .iter()
-                .map(|(actor_id, booked)| (*actor_id, booked.clone()))
-                .collect::<HashMap<ActorId, _>>()
-        };
-
-        let mut inserted = 0;
-        let mut deleted = 0;
-
-        let mut db_elapsed = Duration::new(0, 0);
-
-        for (actor_id, booked) in bookie_clone {
-            // pull the current db version -> version map at the present time
-            // these are only updated _after_ a transaction has been committed, via a write lock
-            // so it should be representative of the current state.
-            let mut versions = {
-                match timeout(
-                    Duration::from_secs(1),
-                    booked.read(format!(
-                        "clear_overwritten_versions:{}",
-                        actor_id.as_simple()
-                    )),
-                )
-                .await
-                {
-                    Ok(booked) => booked.current_versions(),
-                    Err(_) => {
-                        info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
-                        continue;
-                    }
-                }
-            };
-
-            if versions.is_empty() {
-                continue;
-            }
-
-            // we're using a read connection here, starting a read-only transaction
-            // this should be representative of the state of current versions from the actor
-            let cleared_versions = match pool.read().await {
-                Ok(mut conn) => {
-                    let start = Instant::now();
-                    let res = block_in_place(|| {
-                        let tx = conn.transaction()?;
-                        find_cleared_db_versions(&tx, &actor_id)
-                    });
-                    db_elapsed += start.elapsed();
-                    match res {
-                        Ok(cleared) => {
-                            debug!(
-                                actor_id = %actor_id,
-                                "Aggregated {} DB versions to clear in {:?}",
-                                cleared.len(),
-                                start.elapsed()
-                            );
-                            cleared
-                        }
-                        Err(e) => {
-                            error!("could not get cleared versions: {e}");
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("could not get read connection: {e}");
-                    continue;
-                }
-            };
-
-            if !cleared_versions.is_empty() {
-                let mut to_clear = Vec::new();
-
-                for db_v in cleared_versions {
-                    if let Some(v) = versions.remove(&db_v) {
-                        to_clear.push((db_v, v))
-                    }
-                }
-
-                if !to_clear.is_empty() {
-                    // use a write lock here so we can mutate the bookkept state
-                    let mut bookedw = booked
-                        .write(format!("clearing:{}", actor_id.as_simple()))
-                        .await;
-
-                    for (_db_v, v) in to_clear.iter() {
-                        // only remove when confirming that version is still considered "current"
-                        if bookedw.contains_current(v) {
-                            // set it as cleared right away
-                            bookedw.insert(*v, KnownDbVersion::Cleared);
-                            deleted += 1;
-                        }
-                    }
-
-                    // find any affected cleared ranges
-                    for range in to_clear
-                        .iter()
-                        .filter_map(|(_, v)| bookedw.cleared.get(v))
-                        .dedup()
-                    {
-                        // schedule for clearing in the background task
-                        if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
-                            error!("could not schedule version to be cleared: {e}");
-                        } else {
-                            inserted += 1;
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
+                .map_err(|e| format!("{e}"))?;
         }
 
-        info!(
+        // pull the current db version -> version map at the present time
+        // these are only updated _after_ a transaction has been committed, via a write lock
+        // so it should be representative of the current state.
+        let mut versions = {
+            match timeout(
+                Duration::from_secs(1),
+                booked.read(format!(
+                    "clear_overwritten_versions:{}",
+                    actor_id.as_simple()
+                )),
+            )
+            .await
+            {
+                Ok(booked) => booked.current_versions(),
+                Err(_) => {
+                    info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
+
+                    if let Some(ref tx) = feedback {
+                        tx.send("timed out acquiring read lock on bookkeeping".into())
+                            .await
+                            .map_err(|e| format!("{e}"))?;
+                    }
+
+                    return Err("Timed out acquiring read lock on bookkeeping".into());
+                }
+            }
+        };
+
+        if versions.is_empty() {
+            if let Some(ref tx) = feedback {
+                tx.send("No versions to compact".into())
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+            }
+            continue;
+        }
+
+        // we're using a read connection here, starting a read-only transaction
+        // this should be representative of the state of current versions from the actor
+        let cleared_versions = match pool.read().await {
+            Ok(mut conn) => {
+                let start = Instant::now();
+                let res = block_in_place(|| {
+                    let tx = conn.transaction()?;
+                    find_cleared_db_versions(&tx, &actor_id)
+                });
+                db_elapsed += start.elapsed();
+                match res {
+                    Ok(cleared) => {
+                        debug!(
+                            actor_id = %actor_id,
+                            "Aggregated {} DB versions to clear in {:?}",
+                            cleared.len(),
+                            start.elapsed()
+                        );
+
+                        if let Some(ref tx) = feedback {
+                            tx.send(format!("Aggregated {} DB versions to clear", cleared.len()))
+                                .await
+                                .map_err(|e| format!("{e}"))?;
+                        }
+
+                        cleared
+                    }
+                    Err(e) => {
+                        error!("could not get cleared versions: {e}");
+
+                        if let Some(ref tx) = feedback {
+                            tx.send(format!("failed to get cleared versions: {e}"))
+                                .await
+                                .map_err(|e| format!("{e}"))?;
+                        }
+
+                        return Err("failed to cleared versions".into());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("could not get read connection: {e}");
+                if let Some(ref tx) = feedback {
+                    tx.send(format!("failed to get read connection: {e}"))
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+                }
+                return Err("could not get read connection".into());
+            }
+        };
+
+        if !cleared_versions.is_empty() {
+            let mut to_clear = Vec::new();
+
+            for db_v in cleared_versions {
+                if let Some(v) = versions.remove(&db_v) {
+                    to_clear.push((db_v, v))
+                }
+            }
+
+            if !to_clear.is_empty() {
+                // use a write lock here so we can mutate the bookkept state
+                let mut bookedw = booked
+                    .write(format!("clearing:{}", actor_id.as_simple()))
+                    .await;
+
+                for (_db_v, v) in to_clear.iter() {
+                    // only remove when confirming that version is still considered "current"
+                    if bookedw.contains_current(v) {
+                        // set it as cleared right away
+                        bookedw.insert(*v, KnownDbVersion::Cleared);
+                        deleted += 1;
+                    }
+                }
+
+                // find any affected cleared ranges
+                for range in to_clear
+                    .iter()
+                    .filter_map(|(_, v)| bookedw.cleared.get(v))
+                    .dedup()
+                {
+                    // schedule for clearing in the background task
+                    if let Err(e) = agent.tx_empty().send((actor_id, range.clone())).await {
+                        error!("could not schedule version to be cleared: {e}");
+                        if let Some(ref tx) = feedback {
+                            tx.send(format!("failed to get queue compaction set: {e}"))
+                                .await
+                                .map_err(|e| format!("{e}"))?;
+                        }
+                    } else {
+                        inserted += 1;
+                    }
+
+                    tokio::task::yield_now().await;
+                }
+
+                if let Some(ref tx) = feedback {
+                    tx.send(format!("Queued {inserted} empty versions to compact"))
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+                }
+            }
+        }
+
+        if let Some(ref tx) = feedback {
+            tx.send(format!("Finshed compacting changes for {actor_id}"))
+                .await
+                .map_err(|e| format!("{e}"))?;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    info!(
             "Compaction done, cleared {} DB bookkeeping table rows (wall time: {:?}, db time: {db_elapsed:?})",
             deleted - inserted,
             start.elapsed()
-        );
-    }
+    );
+
+    Ok(())
 }
 
 /// Load the existing known member state and addresses
