@@ -556,9 +556,11 @@ pub async fn start(
                     let cancel = cancel.clone();
                     async move {
                         // cancel stuff if this loop breaks
-                        let _drop_guard = cancel.drop_guard();
+                        let _drop_guard = cancel.clone().drop_guard();
 
-                        while let Some(decode_res) = stream.next().await {
+                        while let Outcome::Completed(Some(decode_res)) =
+                            stream.next().preemptible(cancel.cancelled()).await
+                        {
                             let msg = match decode_res {
                                 Ok(msg) => msg,
                                 Err(PgWireError::IoError(io_error)) => {
@@ -585,9 +587,9 @@ pub async fn start(
                                     break;
                                 }
                             };
-
                             front_tx.send(msg).await?;
                         }
+
                         debug!("frontend stream is done");
 
                         Ok::<_, BoxError>(())
@@ -597,8 +599,11 @@ pub async fn start(
                 tokio::spawn({
                     let cancel = cancel.clone();
                     async move {
-                        let _drop_guard = cancel.drop_guard();
-                        while let Some(back) = back_rx.recv().await {
+                        let _drop_guard = cancel.clone().drop_guard();
+
+                        while let Outcome::Completed(Some(back)) =
+                            back_rx.recv().preemptible(cancel.cancelled()).await
+                        {
                             match back {
                                 BackendResponse::Message { message, flush } => {
                                     if let PgWireBackendMessage::ErrorResponse(e) = &message {
