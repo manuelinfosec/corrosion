@@ -884,7 +884,7 @@ async fn encode_write_sync_msg(
     write: &mut SendStream,
 ) -> Result<(), SyncSendError> {
     encode_sync_msg(codec, encode_buf, send_buf, msg)?;
-
+    info!("Sending sync payload of size {}", send_buf.len());
     write_buf(send_buf, write).await
 }
 
