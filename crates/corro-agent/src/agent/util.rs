@@ -56,7 +56,7 @@ use rusqlite::{
 use spawn::spawn_counted;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::Sender,
+    sync::mpsc::{error::TrySendError, Sender},
     task::block_in_place,
     time::{sleep, timeout},
 };
@@ -681,9 +681,9 @@ pub async fn sync_loop(
 /// Compact the database by finding cleared versions
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
-    mut rx_partials: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
+    mut rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
 ) {
-    while let Some((actor_id, versions)) = rx_partials.recv().await {
+    while let Some((actor_id, versions)) = rx_clear_buf.recv().await {
         let pool = agent.pool().clone();
         let self_actor_id = agent.actor_id();
         tokio::spawn(async move {
@@ -1310,8 +1310,26 @@ pub async fn process_multiple_changes(
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        if let Err(e) = agent.tx_empty().try_send((*actor_id, versions.clone())) {
-                            error!("could not schedule version to be cleared: {e}");
+                        info!(
+                            "Empty channel capacity RIGHT NOW: {}",
+                            agent.tx_empty().capacity()
+                        );
+                        match agent.tx_empty().try_send((*actor_id, versions.clone())) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(again)) => {
+                                let tx_empty = agent.tx_empty().clone();
+                                info!(
+                                    "tx_empty channel is full: spawn task to retry it out-of-order"
+                                );
+                                tokio::spawn(async move {
+                                    if let Err(e) = tx_empty.send(again).await {
+                                        error!("Failed to schedule version to be cleared out-of-order: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("could not schedule version to be cleared: {e}");
+                            }
                         }
                     }
                 }
@@ -1378,7 +1396,7 @@ pub async fn process_multiple_changes(
     })?;
 
     let mut change_chunk_size = 0;
-    
+
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
         agent

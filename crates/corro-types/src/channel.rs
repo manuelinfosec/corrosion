@@ -95,6 +95,10 @@ pub fn bounded<T: Send + 'static>(
 }
 
 impl<T> CorroSender<T> {
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+    
     pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
         let before = Instant::now();
         self.inner
