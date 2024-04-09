@@ -416,6 +416,8 @@ pub async fn handle_changes(
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
+    let mut last_wakeup = Instant::now();
+    
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
@@ -437,12 +439,14 @@ pub async fn handle_changes(
             }
 
             debug!(count = %tmp_count, "spawning processing multiple changes from beginning of loop");
+            histogram!("corro.agent.changes.channel_queued.seconds").record(last_wakeup.elapsed().as_secs_f64());
             join_set.spawn(util::process_multiple_changes(
                 agent.clone(),
                 bookie.clone(),
                 std::mem::take(&mut buf),
             ));
 
+            last_wakeup = Instant::now();
             count -= tmp_count;
         }
 

@@ -1310,10 +1310,6 @@ pub async fn process_multiple_changes(
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        info!(
-                            "Empty channel capacity RIGHT NOW: {}",
-                            agent.tx_empty().capacity()
-                        );
                         match agent.tx_empty().try_send((*actor_id, versions.clone())) {
                             Ok(()) => {}
                             Err(TrySendError::Full(again)) => {
