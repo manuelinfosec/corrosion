@@ -405,7 +405,7 @@ pub async fn handle_changes(
     let mut buf = vec![];
     let mut count = 0;
 
-    const MAX_CONCURRENT: usize = 5;
+    const MAX_CONCURRENT: usize = 12;
     let mut join_set = JoinSet::new();
 
     let mut max_wait = tokio::time::interval(Duration::from_millis(
